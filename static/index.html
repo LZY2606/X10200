@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>晶格候选室</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0;
+         background:#0f1420; color:#dde3ee; }
+  header { padding:10px 16px; background:#171e30; display:flex; gap:12px;
+           align-items:center; border-bottom:1px solid #2a3350; }
+  header h1 { font-size:18px; margin:0; }
+  button { background:#2b3a5e; color:#dde3ee; border:1px solid #3d4f7d;
+           border-radius:4px; padding:4px 10px; cursor:pointer; }
+  button:hover { background:#37497a; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding:10px; }
+  section { background:#151b2c; border:1px solid #26304c; border-radius:6px;
+            padding:10px; }
+  h2 { font-size:14px; margin:0 0 8px; color:#9fb4e0; }
+  canvas { background:#0b0f1a; border-radius:4px; width:100%; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th, td { border-bottom:1px solid #232c46; padding:3px 6px; text-align:left; }
+  th { color:#8ea3cf; font-weight:600; }
+  .hkl { color:#7fd4ff; cursor:pointer; text-decoration:underline; }
+  .fam { border:1px solid #2c3a5e; border-radius:5px; margin-bottom:8px;
+         padding:6px; }
+  .fam h3 { margin:0 0 4px; font-size:13px; color:#ffd479; }
+  .cand { margin:4px 0; padding:4px 6px; background:#1a2138; border-radius:4px;
+          cursor:pointer; }
+  .cand.sel { outline:2px solid #7fd4ff; }
+  .cand.invalid { opacity:.45; }
+  .score { display:inline-block; margin-right:10px; font-size:11px; }
+  .score b { color:#a8e6a1; }
+  .score.warn b { color:#ff9c6b; }
+  #detail { font-size:12px; white-space:pre-wrap; max-height:260px;
+            overflow:auto; }
+  .tag { font-size:10px; padding:1px 5px; border-radius:3px; margin-left:4px; }
+  .tag.out { background:#5e2b2b; } .tag.in { background:#2b5e34; }
+  .tag.un { background:#444; } .tag.lock { background:#5e4a2b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>晶格候选室</h1>
+  <button id="seedBtn">载入演示数据</button>
+  <select id="analysisSel"></select>
+  <button id="forkBtn">分叉当前分析</button>
+  <button id="freezeBtn">冻结解释</button>
+  <span id="msg" style="font-size:12px;color:#9fb4e0"></span>
+</header>
+<main>
+  <section>
+    <h2>倒易空间投影（观测 · 预测）</h2>
+    <canvas id="proj" width="520" height="380"></canvas>
+  </section>
+  <section>
+    <h2>残差分布（加权残差）</h2>
+    <canvas id="hist" width="520" height="180"></canvas>
+    <h2 style="margin-top:8px">候选族 / 评分分量</h2>
+    <div id="families" style="max-height:240px;overflow:auto"></div>
+  </section>
+  <section>
+    <h2>反射对应（点击 hkl 回溯观测与变换链）</h2>
+    <div style="max-height:340px;overflow:auto">
+    <table id="reflTable"><thead><tr>
+      <th>hkl</th><th>观测</th><th>加权残差</th><th>状态</th>
+      <th>操作</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+  <section>
+    <h2>观测与变换链</h2>
+    <div id="detail">选择一条反射查看。</div>
+  </section>
+</main>
+<script>
+let state = null, analyses = [], selCand = null, observations = [];
+
+const $ = id => document.getElementById(id);
+const fmt = (x, d=3) => (typeof x === 'number' && isFinite(x)) ? x.toFixed(d) : '—';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  return r.json();
+}
+function say(t) { $('msg').textContent = t; }
+
+async function refresh() {
+  analyses = (await api('/api/analyses')).analyses;
+  observations = (await api('/api/observations')).observations;
+  const sel = $('analysisSel');
+  sel.innerHTML = analyses.map(a =>
+    `<option value="${a.id}">#${a.id} ${a.name} (v${a.version})</option>`).join('');
+  if (analyses.length) {
+    sel.value = analyses[analyses.length-1].id;
+    await loadAnalysis(sel.value);
+  }
+}
+
+async function loadAnalysis(id) {
+  state = await api('/api/analyses/' + id);
+  selCand = (state.candidates.find(c => c.valid) || state.candidates[0]) || null;
+  renderFamilies(); renderRefl(); drawProj(); drawHist();
+}
+
+function renderFamilies() {
+  const box = $('families'); box.innerHTML = '';
+  for (const fam of state.families) {
+    const div = document.createElement('div'); div.className = 'fam';
+    div.innerHTML = `<h3>族 ${fam.id}（${fam.candidates.length} 个候选）</h3>`;
+    for (const cid of fam.candidates) {
+      const c = state.candidates.find(x => x.id === cid);
+      const s = c.scores;
+      const el = document.createElement('div');
+      el.className = 'cand' + (c.valid ? '' : ' invalid') +
+                     (selCand && c.id === selCand.id ? ' sel' : '');
+      el.innerHTML =
+        `#${c.id}${c.valid ? '' : ' <span class="tag out">已过期</span>'}<br>` +
+        `<span class="score">已索引 <b>${fmt(s.indexed_fraction,2)}</b></span>` +
+        `<span class="score">加权残差 <b>${fmt(s.weighted_residual,2)}</b></span>` +
+        `<span class="score">复杂度 <b>${fmt(s.complexity,2)}</b></span>` +
+        `<span class="score ${s.outlier_budget_exceeded ? 'warn':''}">离群 ` +
+        `<b>${s.outliers}/${s.outlier_budget}</b></span>`;
+      el.onclick = () => { selCand = c; renderFamilies(); renderRefl();
+                           drawProj(); drawHist(); };
+      div.appendChild(el);
+    }
+    box.appendChild(div);
+  }
+}
+
+function renderRefl() {
+  const tb = $('reflTable').querySelector('tbody'); tb.innerHTML = '';
+  if (!selCand) return;
+  for (const r of selCand.reflections) {
+    const tr = document.createElement('tr');
+    const cls = r.status === 'inlier' ? 'in' : r.status === 'outlier' ? 'out'
+              : r.status === 'locked' ? 'lock' : 'un';
+    tr.innerHTML =
+      `<td><span class="hkl">(${r.hkl.join(',')})</span></td>` +
+      `<td>#${r.observation_id}</td><td>${fmt(r.weighted_residual,2)}</td>` +
+      `<td><span class="tag ${cls}">${r.status}</span></td>` +
+      `<td><button data-a="lock">锁定</button> <button data-a="excl">排除</button></td>`;
+    tr.querySelector('.hkl').onclick = () => showDetail(r);
+    const [bLock, bExcl] = tr.querySelectorAll('button');
+    bLock.onclick = () => mark(r.observation_id, {locked: true});
+    bExcl.onclick = () => mark(r.observation_id, {excluded: true});
+    tb.appendChild(tr);
+  }
+}
+
+async function mark(obsId, body) {
+  await api(`/api/analyses/${state.id}/marks`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({observation_id: obsId, ...body})});
+  say('已标记，依赖候选已过期');
+  await loadAnalysis(state.id);
+}
+
+async function showDetail(r) {
+  const obs = observations.find(o => o.id === r.observation_id);
+  const chain = selCand.transform_chain.map((m, i) =>
+    `  M${i} = [${m.map(row => row.join(' ')).join(' ; ')}]`).join('\n');
+  $('detail').textContent =
+    `hkl = (${r.hkl.join(', ')})\n` +
+    `观测 #${obs.id}  q = [${obs.q.map(v => fmt(v,4)).join(', ')}]  ` +
+    `强度 ${fmt(obs.intensity,2)}  校准版本 ${obs.calibration_version}\n` +
+    `预测 q = [${r.predicted_q.map(v => fmt(v,4)).join(', ')}]\n` +
+    `残差 = [${r.residual.map(v => fmt(v,4)).join(', ')}]  ` +
+    `加权残差 ${fmt(r.weighted_residual,3)}\n` +
+    `族 ${selCand.family_id}，到族典范基的变换:\n` +
+    `  T = [${selCand.transform_to_family.map(row => row.join(' ')).join(' ; ')}]\n` +
+    `约化变换链（右乘，共 ${selCand.transform_chain.length} 步）:\n${chain || '  （恒等）'}\n` +
+    `精修步数: ${selCand.refinement_steps.length}`;
+}
+
+function project(qs) {
+  // Orthographic projection onto the two largest-variance axes (PCA-lite).
+  const n = qs.length, m = [0,0,0];
+  qs.forEach(q => q.forEach((v,i) => m[i] += v/n));
+  const c = qs.map(q => q.map((v,i) => v - m[i]));
+  let u = [1,0,0], best = -1;
+  for (let i = 0; i < 3; i++) {
+    const v = c.reduce((s,q) => s + q[i]*q[i], 0);
+    if (v > best) { best = v; u = [0,0,0]; u[i] = 1; }
+  }
+  // second axis: orthogonal direction with max variance
+  let w = null; best = -1;
+  for (let i = 0; i < 3; i++) {
+    if (u[i] === 1) continue;
+    const v = c.reduce((s,q) => s + q[i]*q[i], 0);
+    if (v > best) { best = v; w = [0,0,0]; w[i] = 1; }
+  }
+  return c.map(q => [q[u.indexOf(1)], q[w.indexOf(1)]]);
+}
+
+function drawProj() {
+  const cv = $('proj'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!observations.length) return;
+  const qs = observations.map(o => o.q);
+  const pts = project(qs);
+  const all = pts.flat();
+  const mx = Math.max(...pts.map(p => Math.abs(p[0])), 1e-6);
+  const my = Math.max(...pts.map(p => Math.abs(p[1])), 1e-6);
+  const sx = cv.width/2.4/mx, sy = cv.height/2.4/my, s = Math.min(sx, sy);
+  const X = p => cv.width/2 + p[0]*s, Y = p => cv.height/2 - p[1]*s;
+  ctx.strokeStyle = '#26304c';
+  ctx.beginPath(); ctx.moveTo(0, cv.height/2); ctx.lineTo(cv.width, cv.height/2);
+  ctx.moveTo(cv.width/2, 0); ctx.lineTo(cv.width/2, cv.height); ctx.stroke();
+  pts.forEach((p, i) => {
+    ctx.fillStyle = '#7fd4ff';
+    ctx.beginPath(); ctx.arc(X(p), Y(p), 3, 0, 7); ctx.fill();
+  });
+  if (selCand) {
+    const pq = project(selCand.reflections.map(r => r.predicted_q));
+    selCand.reflections.forEach((r, i) => {
+      ctx.strokeStyle = r.is_outlier ? '#ff9c6b' : '#a8e6a1';
+      ctx.beginPath(); ctx.arc(X(pq[i]), Y(pq[i]), 5, 0, 7); ctx.stroke();
+    });
+  }
+}
+
+function drawHist() {
+  const cv = $('hist'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!selCand) return;
+  const vals = selCand.reflections.map(r => r.weighted_residual);
+  const max = Math.max(...vals, 1e-6), bins = new Array(20).fill(0);
+  vals.forEach(v => bins[Math.min(19, Math.floor(v/max*20))]++);
+  const peak = Math.max(...bins, 1);
+  bins.forEach((b, i) => {
+    ctx.fillStyle = '#4d6fb3';
+    const h = b/peak * (cv.height - 20);
+    ctx.fillRect(i*(cv.width/20)+1, cv.height - h, cv.width/20 - 2, h);
+  });
+  ctx.fillStyle = '#8ea3cf'; ctx.font = '11px sans-serif';
+  ctx.fillText(`0 … ${fmt(max,1)}`, 6, 12);
+}
+
+$('seedBtn').onclick = async () => {
+  const r = await api('/api/demo/seed', {method: 'POST'});
+  say(`已载入 ${r.peaks} 个峰，生成 ${r.n_candidates} 个候选`);
+  await refresh();
+};
+$('analysisSel').onchange = e => loadAnalysis(e.target.value);
+$('forkBtn').onclick = async () => {
+  if (!state) return;
+  const r = await api(`/api/analyses/${state.id}/fork`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  say(`已分叉为分析 #${r.analysis_id}`); await refresh();
+};
+$('freezeBtn').onclick = async () => {
+  if (!state) return;
+  try {
+    const r = await api(`/api/analyses/${state.id}/freeze`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({expected_version: state.version})});
+    say(`已冻结 v${r.analysis_version}（校准/容差/人工标记已钉住）`);
+  } catch (e) { say('冻结冲突：' + e.message); }
+};
+refresh().catch(e => say(e.message));
+</script>
+</body>
+</html>
