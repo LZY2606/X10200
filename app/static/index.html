@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>晶格候选室</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#28324a; --ink:#e6ebf5;
+          --muted:#8b96ad; --accent:#6ea8fe; --warn:#f0a35e; --bad:#ef6f6f;
+          --ok:#69c792; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",
+         sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:12px 18px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; letter-spacing:2px; }
+  button { background:#22304d; color:var(--ink); border:1px solid var(--line);
+           border-radius:6px; padding:5px 12px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .layout { display:grid; grid-template-columns:1.2fr 1fr; gap:12px;
+            padding:12px 18px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:12px; }
+  .panel h2 { font-size:13px; margin:0 0 8px; color:var(--muted);
+              text-transform:uppercase; letter-spacing:1px; }
+  canvas { background:#0c111c; border-radius:8px; display:block;
+           width:100%; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:4px 6px; border-bottom:1px solid var(--line);
+          text-align:left; white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0;
+       background:var(--panel); }
+  tr.sel { background:#22304d; }
+  tr.expired td, tr.superseded td { color:var(--muted); }
+  .score { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
+  .score .box { background:#0e1525; border:1px solid var(--line);
+                border-radius:6px; padding:6px; }
+  .score .k { color:var(--muted); font-size:11px; }
+  .score .v { font-size:14px; }
+  .tag { display:inline-block; padding:0 6px; border-radius:10px;
+         font-size:11px; border:1px solid var(--line); }
+  .tag.dom { background:#22304d; }
+  .tag.fam { background:#274034; color:var(--ok); }
+  .tag.out { background:#4a2b2b; color:var(--bad); }
+  .tag.lock { background:#4a3a22; color:var(--warn); }
+  #detail { margin:0 18px 18px; }
+  #detail .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  pre { background:#0c111c; border:1px solid var(--line); border-radius:8px;
+        padding:8px; overflow:auto; max-height:260px; font-size:11px; }
+  .hint { color:var(--muted); }
+  #toast { position:fixed; right:18px; bottom:18px; max-width:380px;
+           background:#111a2c; border:1px solid var(--accent);
+           border-radius:8px; padding:10px 14px; display:none; }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input { background:#0e1525; border:1px solid var(--line); color:var(--ink);
+          border-radius:6px; padding:4px 8px; width:120px; }
+  .hkl-btn { color:var(--accent); cursor:pointer; text-decoration:underline;
+             background:none; border:none; padding:0; font:inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>晶格候选室</h1>
+  <div class="controls">
+    <button id="btn-demo">载入固定合成数据</button>
+    <button id="btn-regen">重新生成候选</button>
+    <span class="hint">校准偏移</span>
+    <input id="cal-x" placeholder="x">
+    <input id="cal-y" placeholder="y">
+    <input id="cal-z" placeholder="z">
+    <button id="btn-cal">应用校准</button>
+    <button id="btn-refine">按当前候选重拟合</button>
+    <button id="btn-fork">分叉</button>
+    <button id="btn-freeze">冻结解释</button>
+  </div>
+  <span id="meta" class="hint"></span>
+</header>
+
+<div class="layout">
+  <section class="panel">
+    <h2>倒易空间投影（去校准偏移，xy 平面）</h2>
+    <canvas id="space" width="620" height="360"></canvas>
+    <p class="hint">圆圈=观测；颜色按晶域/角色：蓝=已索引，红=离群，
+       灰=未索引，叉=排除；十字标记=当前候选预测点。</p>
+  </section>
+  <section class="panel">
+    <h2>残差分布（Mahalanobis，加权）</h2>
+    <canvas id="hist" width="620" height="360"></canvas>
+  </section>
+</div>
+
+<div class="layout">
+  <section class="panel">
+    <h2>候选族与候选（四项分项，不设总分）</h2>
+    <div style="max-height:330px; overflow:auto">
+    <table id="cand-table">
+      <thead><tr>
+        <th>#</th><th>族</th><th>晶域</th><th>状态</th>
+        <th>已索引比例</th><th>加权残差</th><th>复杂度</th>
+        <th>离群预算</th><th>条件数</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>当前候选：反射对应（点 hkl 追溯观测与变换链）</h2>
+    <div style="max-height:330px; overflow:auto">
+    <table id="refl-table">
+      <thead><tr>
+        <th>峰号</th><th>hkl</th><th>几何残差</th><th>加权</th>
+        <th>角色</th><th>标记</th><th>操作</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+  </section>
+</div>
+
+<section class="panel" id="detail">
+  <h2>观测原始记录与坐标变换链</h2>
+  <div class="grid">
+    <div>
+      <h2 id="obs-title" class="hint">点击任意 hkl 查看</h2>
+      <pre id="obs-json" class="hint">—</pre>
+    </div>
+    <div>
+      <h2 class="hint">候选基约化/同族变换链</h2>
+      <pre id="chain-json" class="hint">—</pre>
+    </div>
+  </div>
+</section>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
