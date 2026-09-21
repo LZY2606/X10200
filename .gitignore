@@ -27,6 +27,7 @@ Pods/
 .env.*
 *.log
 coverage/
+lattice.db
 .coverage
 .nyc_output/
 .cache/

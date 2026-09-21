@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>晶格候选室</title>
+<style>
+  :root { --bg:#0f1420; --panel:#1a2233; --line:#2c3a55; --fg:#dfe7f5;
+          --dim:#8fa0c0; --acc:#5ec1ff; --warn:#ffb454; --bad:#ff6b6b; --ok:#7ee2a0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "SF Pro Text","PingFang SC",system-ui,sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line);
+           display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; color:var(--acc); }
+  button { background:#243252; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:4px 10px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  input { background:#101828; color:var(--fg); border:1px solid var(--line);
+          border-radius:4px; padding:3px 6px; width:70px; }
+  main { display:grid; grid-template-columns: 1.2fr 1fr 1.3fr; gap:10px; padding:10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:10px; min-height:200px; }
+  .panel h2 { font-size:14px; margin:0 0 8px; color:var(--dim); }
+  .fam { border:1px solid var(--line); border-radius:6px; margin-bottom:8px; padding:6px; }
+  .fam h3 { margin:0 0 4px; font-size:13px; color:var(--acc); }
+  .cand { padding:6px; border-radius:6px; margin:4px 0; cursor:pointer;
+          border:1px solid transparent; }
+  .cand:hover, .cand.sel { border-color:var(--acc); background:#22304e; }
+  .scores { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; font-size:12px; }
+  .scores div { background:#141c2e; border-radius:4px; padding:3px 5px; }
+  .scores b { display:block; color:var(--dim); font-weight:normal; font-size:11px; }
+  .stale { color:var(--warn); font-size:12px; }
+  .over { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:3px 5px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:var(--dim); font-weight:normal; }
+  .hkl { color:var(--acc); cursor:pointer; text-decoration:underline; }
+  .outlier { color:var(--bad); }
+  .overlap { color:var(--warn); }
+  #detail { margin-top:8px; font-size:12px; background:#141c2e; border-radius:6px;
+            padding:8px; white-space:pre-wrap; word-break:break-all; }
+  .tag { font-size:11px; padding:1px 5px; border-radius:4px; background:#243252;
+         margin-left:4px; }
+  svg text { fill:var(--dim); font-size:10px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:4px 0; }
+  #msg { color:var(--ok); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>晶格候选室</h1>
+  <span class="tag">分析 #<span id="aid">-</span></span>
+  <span class="tag">校准 <span id="calver">-</span></span>
+  <span class="tag">草案 v<span id="draft">0</span></span>
+  <button onclick="loadSample()">载入示例数据</button>
+  <button onclick="generate()">生成候选</button>
+  <button onclick="forkAnalysis()">从当前分析分叉</button>
+  <button onclick="freeze()">冻结解释</button>
+  <span class="row">校准偏差
+    <input id="bx" step="0.0001" value="0"><input id="by" step="0.0001" value="0"><input id="bz" step="0.0001" value="0">
+    <button onclick="applyCalib()">调整校准点</button>
+  </span>
+  <span id="msg"></span>
+</header>
+<main>
+  <div class="panel"><h2>倒易空间投影 (q_x–q_y)</h2><svg id="proj" width="100%" height="420"></svg></div>
+  <div class="panel"><h2>候选族</h2><div id="fams">尚未生成候选。</div></div>
+  <div class="panel">
+    <h2>反射对应与残差分布</h2>
+    <svg id="hist" width="100%" height="110"></svg>
+    <div id="rtable"></div>
+    <div id="detail"></div>
+  </div>
+</main>
+<script>
+let AID = null, STATE = null, SEL = null, DET = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts ? {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body:JSON.stringify(opts)} : undefined);
+  if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t); }
+  return r.json();
+}
+function say(m){ document.getElementById('msg').textContent = m; setTimeout(()=>document.getElementById('msg').textContent='', 4000); }
+
+async function ensureAnalysis() {
+  if (AID === null) {
+    const saved = localStorage.getItem('lattice_aid');
+    if (saved) { AID = +saved; }
+    else { const a = await api('/analyses?name=default', {}); AID = a.id; }
+    localStorage.setItem('lattice_aid', AID);
+  }
+}
+async function refresh() {
+  STATE = await api('/analyses/' + AID + '/state');
+  document.getElementById('aid').textContent = STATE.id;
+  document.getElementById('calver').textContent = STATE.calibration_version;
+  document.getElementById('draft').textContent = STATE.draft_version;
+  document.getElementById('bx').value = STATE.bias[0];
+  document.getElementById('by').value = STATE.bias[1];
+  document.getElementById('bz').value = STATE.bias[2];
+  renderProjection(); renderFamilies();
+  if (SEL) { const c = STATE.candidates.find(c=>c.id===SEL); if (c) renderDetail(c.id); }
+}
+async function loadSample(){ await ensureAnalysis(); await api(`/analyses/${AID}/load_sample`,{}); say('示例数据已导入'); await refresh(); }
+async function generate(){ await ensureAnalysis(); const r = await api(`/analyses/${AID}/generate`,{}); say(`生成 ${r.n_candidates} 个候选 / ${r.n_families} 个族`); await refresh(); }
+async function forkAnalysis(){ const r = await api(`/analyses/${AID}/fork`,{name:'fork-'+Date.now()}); AID = r.id; localStorage.setItem('lattice_aid', AID); SEL=null; say('已分叉到分析 #'+AID); await refresh(); }
+async function freeze(){
+  try { const r = await api(`/analyses/${AID}/freeze`,{draft_version:STATE.draft_version, note:'ui'});
+        say('已冻结，冻结号 '+r.freeze_id); }
+  catch(e){ say('冻结冲突：草案已过期，请刷新'); }
+  await refresh();
+}
+async function applyCalib(){
+  await api(`/analyses/${AID}/calibration`,{version: STATE.calibration_version+'*',
+    bias:[+bx.value,+by.value,+bz.value]});
+  say('校准已调整，依赖候选已过期'); await refresh();
+}
+async function setFlag(obs, field, value){
+  await api(`/observations/${obs}/${field}`,{value}); await refresh();
+  if (SEL) renderDetail(SEL);
+}
+
+function renderProjection(){
+  const svg = document.getElementById('proj');
+  const obs = STATE.observations.filter(o=>!o.excluded);
+  if (!obs.length){ svg.innerHTML='<text x="10" y="20">无观测数据</text>'; return; }
+  const xs = obs.map(o=>o.q[0]), ys = obs.map(o=>o.q[1]);
+  const x0=Math.min(...xs), x1=Math.max(...xs), y0=Math.min(...ys), y1=Math.max(...ys);
+  const W=520,H=420,P=30;
+  const sx=v=>P+(v-x0)/((x1-x0)||1)*(W-2*P), sy=v=>H-P-(v-y0)/((y1-y0)||1)*(H-2*P);
+  let amap = {};
+  if (DET){ DET.assignments.forEach(a=>amap[a.observation_id]=a); }
+  let html = `<line x1="${P}" y1="${H-P}" x2="${W-P}" y2="${H-P}" stroke="#2c3a55"/>
+              <line x1="${P}" y1="${P}" x2="${P}" y2="${H-P}" stroke="#2c3a55"/>`;
+  for (const o of obs){
+    let color = '#8fa0c0';
+    const a = amap[o.id];
+    if (a){ color = a.is_outlier ? '#ff6b6b' : (a.indexed ? '#5ec1ff' : '#8fa0c0'); }
+    html += `<circle cx="${sx(o.q[0])}" cy="${sy(o.q[1])}" r="${a&&a.overlap?5:3.5}" fill="${color}"
+      opacity="${o.locked?1:0.75}" stroke="${o.locked?'#7ee2a0':'none'}"
+      onclick="highlightObs(${o.id})" style="cursor:pointer">
+      <title>#${o.id} q=(${o.q.map(v=>v.toFixed(4))}) I=${o.intensity.toFixed(0)}</title></circle>`;
+  }
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  svg.innerHTML = html;
+}
+
+function renderFamilies(){
+  const el = document.getElementById('fams');
+  if (!STATE.candidates.length){ el.innerHTML='尚未生成候选。'; return; }
+  let html='';
+  for (const f of STATE.families){
+    html += `<div class="fam"><h3>族 ${f.family_id}（${f.candidate_ids.length} 个候选）</h3>`;
+    for (const cid of f.candidate_ids){
+      const c = STATE.candidates.find(c=>c.id===cid);
+      const s = c.scores;
+      html += `<div class="cand ${SEL===cid?'sel':''}" onclick="renderDetail(${cid})">
+        <b>候选 #${cid}</b> ${c.stale?'<span class="stale">[已过期]</span>':''}
+        ${s.over_budget?'<span class="over">[超出离群预算]</span>':''}
+        <div class="scores">
+          <div><b>已索引比例</b>${(s.indexed_fraction*100).toFixed(1)}% (${s.n_indexed}/${s.n_total})</div>
+          <div><b>加权残差</b>${isFinite(s.weighted_residual)?s.weighted_residual.toFixed(3):'—'}</div>
+          <div><b>复杂度</b>${s.complexity.toFixed(5)}</div>
+          <div><b>离群预算</b>${s.outlier_used}/${s.outlier_budget}</div>
+        </div></div>`;
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function renderDetail(cid){
+  SEL = cid;
+  const c = await api('/candidates/'+cid);
+  DET = c;
+  renderProjection();
+  renderFamilies();
+  // 残差分布直方图
+  const vals = c.assignments.filter(a=>a.indexed).map(a=>a.d2);
+  const hist = document.getElementById('hist');
+  const bins = new Array(10).fill(0);
+  const maxv = Math.max(1e-9, ...vals);
+  vals.forEach(v=>bins[Math.min(9, Math.floor(v/maxv*10))]++);
+  const bw = 40, Hh = 100, mx = Math.max(1,...bins);
+  hist.innerHTML = bins.map((b,i)=>`<rect x="${i*bw+20}" y="${Hh-b/mx*(Hh-15)}" width="${bw-4}" height="${b/mx*(Hh-15)}" fill="#5ec1ff" opacity="0.8"><title>${b}</title></rect>`).join('')
+    + `<text x="20" y="${Hh}">0</text><text x="${20+9*bw}" y="${Hh}">${maxv.toFixed(1)}</text>`;
+  // 反射对应表
+  const obsById = {}; STATE.observations.forEach(o=>obsById[o.id]=o);
+  let rows = c.assignments.map(a=>{
+    const o = obsById[a.observation_id];
+    const cls = a.is_outlier?'outlier':(a.overlap?'overlap':'');
+    return `<tr class="${cls}">
+      <td>#${a.observation_id}</td>
+      <td class="hkl" onclick="showChain(${cid},${a.observation_id})">(${a.hkl.join(',')})</td>
+      <td>${a.predicted.map(v=>v.toFixed(4)).join(' ')}</td>
+      <td>${a.d2.toFixed(2)}</td>
+      <td>${a.is_outlier?'离群':''}${a.overlap?' 重叠':''}</td>
+      <td><button onclick="setFlag(${a.observation_id},'lock',${!o.locked})">${o.locked?'解锁':'锁定'}</button>
+          <button onclick="setFlag(${a.observation_id},'exclude',true)">排除</button></td></tr>`;
+  }).join('');
+  document.getElementById('rtable').innerHTML =
+    `<p>候选 #${cid} ${c.stale?'<span class="stale">[已过期]</span>':''}</p>
+     <table><tr><th>观测</th><th>hkl</th><th>预测位置</th><th>加权残差</th><th>标记</th><th>操作</th></tr>${rows}</table>`;
+}
+
+async function showChain(cid, obsId){
+  const c = await api('/candidates/'+cid);
+  const o = STATE.observations.find(o=>o.id===obsId);
+  const a = c.assignments.find(a=>a.observation_id===obsId);
+  const steps = c.reduction_steps.map((m,i)=>`约化步骤${i+1}: ${JSON.stringify(m)}`).join('\n');
+  document.getElementById('detail').textContent =
+`观测 #${obsId}
+原始 q = (${o.q.map(v=>v.toFixed(5)).join(', ')})  强度 = ${o.intensity.toFixed(1)}
+协方差(上三角) = ${o.cov.map(v=>v.toExponential(2)).join(', ')}
+校准版本 = ${o.calibration_version}  当前偏差 = (${STATE.bias.map(v=>v.toFixed(4)).join(', ')})
+hkl = (${a.hkl.join(', ')})  预测 = (${a.predicted.map(v=>v.toFixed(5)).join(', ')})
+残差 = (${a.residual.map(v=>v.toExponential(2)).join(', ')})  加权残差 d² = ${a.d2.toFixed(3)}
+离群 = ${a.is_outlier}  重叠 = ${a.overlap}
+—— 变换链 ——
+种子基: ${JSON.stringify(c.seed_basis)}
+${steps || '（无需约化步骤）'}
+族内变换矩阵: ${JSON.stringify(c.family_transform)}
+约化基: ${JSON.stringify(c.basis.map(r=>r.map(v=>+v.toFixed(6))))}`;
+}
+function highlightObs(id){ say('观测 #'+id); }
+
+(async ()=>{ await ensureAnalysis(); try{ await refresh(); }catch(e){ localStorage.removeItem('lattice_aid'); } })();
+</script>
+</body>
+</html>
